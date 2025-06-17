@@ -1,16 +1,31 @@
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.IdentityModel.Tokens;
-using System.Security.Claims; // 用于 ClaimTypes
+using System.Security.Claims;
+using Microsoft.Extensions.Logging;
+using System.Linq; // 确保有这个 using
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
 
-// 添加对控制器的支持
-builder.Services.AddControllers(); 
+// 强制设置控制台日志的最低级别为 Debug
+builder.Logging.ClearProviders();
+builder.Logging.AddConsole(options => options.LogToStandardErrorThreshold = LogLevel.Debug);
+builder.Logging.SetMinimumLevel(LogLevel.Debug);
 
-// 配置 Swagger/OpenAPI 支持
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy(name: "MyAllowSpecificOrigins",
+        builder =>
+        {
+            builder.WithOrigins("http://localhost:8080")
+                .AllowAnyHeader()
+                .AllowAnyMethod();
+        });
+});
+
+builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
@@ -18,25 +33,91 @@ builder.Services.AddSwaggerGen();
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
     {
-        // 认证服务器的地址（Orchard CoreAuthServer 的实际 URL）
-        // 确保这里是 http://localhost:5233，与您的认证服务器实际运行的协议和端口一致
-        options.Authority = "http://localhost:5233"; 
+        options.Authority = "http://localhost:5233/";
+        options.RequireHttpsMetadata = false;
+        options.Audience = "api1";
 
-        // 既然 Authority 是 HTTP，这里就必须设置为 false，不依赖于 IsDevelopment() 判断
-        options.RequireHttpsMetadata = false; 
+        // *** 禁用默认的 Claims 映射 ***
+        options.MapInboundClaims = false;
 
-        // 你的 API 的 Audience (受众)，与在 Orchard Core 中配置的 Resource Scope 名称一致
-        options.Audience = "api1"; 
-
-        // 配置令牌验证参数
         options.TokenValidationParameters = new TokenValidationParameters
         {
-            ValidateAudience = true,  // 验证令牌的受众
-            ValidAudience = "api1",   // 再次强调受众，必须与 Orchard Core 中配置的 Resource Scope 名称一致
-            ValidateIssuer = true,    // 验证令牌的颁发者
-            ValidIssuer = "http://localhost:5233", // 必须与 Authority 一致
-            ValidateLifetime = true,  // 验证令牌的有效期
-            ClockSkew = TimeSpan.Zero // 严格校验令牌过期时间，没有时间偏差
+            ValidateAudience = true,
+            ValidAudience = "api1",
+            ValidateIssuer = true,
+            ValidIssuer = "http://localhost:5233/",
+            ValidateLifetime = true,  // 确保这里是 true
+            ClockSkew = TimeSpan.Zero, // 严格校验令牌过期时间
+
+            // ****** 临时添加：自定义令牌生命周期验证 ******
+            // 这会强制 Access Token 在签发后 X 秒内过期
+            LifetimeValidator = (notBefore, expires, securityToken, validationParameters) =>
+            {
+                // 定义一个短的有效时间，例如 60 秒 (1分钟)
+                var shortLifetime = TimeSpan.FromSeconds(10);
+
+                // 计算令牌的实际生命周期
+                if (expires.HasValue && notBefore.HasValue)
+                {
+                    // 令牌的实际有效时间
+                    var actualLifetime = expires.Value - notBefore.Value;
+
+                    // 如果实际生命周期大于我们想要的短生命周期，则按短生命周期计算过期
+                    // 这将导致令牌在短生命周期后被认为是过期的
+                    if (actualLifetime > shortLifetime)
+                    {
+                        // 强制令牌在 notBefore + shortLifetime 时过期
+                        return DateTime.UtcNow <= notBefore.Value.Add(shortLifetime);
+                    }
+                }
+
+                // 否则，使用原始的过期时间进行验证
+                return expires.HasValue && expires.Value > DateTime.UtcNow;
+            }
+        };
+
+        // ****** 移除或注释掉 OnTokenValidated 事件中的临时响应代码 ******
+        options.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = context =>
+            {
+                var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<JwtBearerHandler>>();
+                logger.LogInformation("Token validated successfully. Claims in principal:");
+                foreach (var claim in context.Principal.Claims)
+                {
+                    logger.LogInformation($"- Type: {claim.Type}, Value: {claim.Value}");
+                }
+                var scopeClaims = context.Principal.Claims.Where(c => c.Type == "scope").ToList();
+                if (scopeClaims.Any())
+                {
+                    logger.LogInformation($"Found 'scope' claims: {string.Join(", ", scopeClaims.Select(c => c.Value))}");
+                    if (scopeClaims.Any(c => c.Value.Contains("api1")))
+                    {
+                        logger.LogInformation("'api1' scope found in claims. Authorization policy should now succeed.");
+                    }
+                    else
+                    {
+                        logger.LogWarning("'api1' scope NOT found among claims, even though 'scope' claims exist. Policy might still fail.");
+                    }
+                }
+                else
+                {
+                    logger.LogWarning("No 'scope' claims found for the authenticated user. Policy will fail.");
+                }
+                return Task.CompletedTask;
+            },
+            OnAuthenticationFailed = context =>
+            {
+                var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<JwtBearerHandler>>();
+                logger.LogError(context.Exception, "Authentication failed during token validation. Exception: {Message}", context.Exception.Message);
+                return Task.CompletedTask;
+            },
+            OnForbidden = context =>
+            {
+                var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<JwtBearerHandler>>();
+                logger.LogWarning("Access forbidden after authentication due to authorization policy failure.");
+                return Task.CompletedTask;
+            }
         };
     });
 
@@ -45,28 +126,28 @@ builder.Services.AddAuthorization(options =>
 {
     options.AddPolicy("ApiScope", policy =>
     {
-        // 要求必须通过认证
         policy.RequireAuthenticatedUser();
-        // 要求令牌中包含 'scope' 声明，且值为 'api1'
-        policy.RequireClaim("scope", "api1");
+        // 修改为 RequireAssertion
+        policy.RequireAssertion(context =>
+        {
+            var scopeClaims = context.User.FindAll("scope");
+            return scopeClaims.Any(c => c.Value.Contains("api1"));
+        });
     });
 });
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
     app.UseSwaggerUI();
 }
 
-// !!! 临时注释掉 HTTPS 重定向，因为您当前使用 HTTP 访问 !!!
-// app.UseHttpsRedirection(); 
+app.UseCors("MyAllowSpecificOrigins");
+app.UseAuthentication();
+app.UseAuthorization();
 
-app.UseAuthentication(); // 启用认证中间件，它会处理 JWT 令牌
-app.UseAuthorization();  // 启用授权中间件，它会根据策略检查权限
+app.MapControllers();
 
-app.MapControllers(); // 映射控制器路由，使 API 端点可以被访问
-
-app.Run(); // 启动应用程序
+app.Run();
