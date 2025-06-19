@@ -28,6 +28,8 @@ builder.Services.AddCors(options =>
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+builder.Services.AddHttpClient(); // 注册 HttpClientFactory
+
 
 // ****** 添加 JWT Bearer 认证配置 ******
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
